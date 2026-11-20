@@ -6,6 +6,32 @@ const $ = id => document.getElementById(id);
 const PAGE_SIZE = 25;
 let client, page = 0, total = 0, requestId = 0, people = [];
 let search = '', sessionReady = false;
+let currentItems = [], sortKey = '', sortDirection = 1;
+const columnFilters = { title: '', prize: '', deadline: '', status: '', updated: '' };
+
+const themeMedia = window.matchMedia('(prefers-color-scheme: dark)');
+
+function preferredTheme() {
+  return localStorage.getItem('theme') || (themeMedia.matches ? 'dark' : 'light');
+}
+
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  const dark = theme === 'dark';
+  $('theme-toggle').querySelector('span').textContent = dark ? '☀' : '☾';
+  $('theme-toggle').setAttribute('aria-label', dark ? '라이트 모드로 전환' : '다크 모드로 전환');
+  document.querySelector('meta[name="theme-color"]').content = dark ? '#101411' : '#f7f9f4';
+}
+
+applyTheme(preferredTheme());
+$('theme-toggle').addEventListener('click', () => {
+  const theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', theme);
+  applyTheme(theme);
+});
+themeMedia.addEventListener('change', event => {
+  if (!localStorage.getItem('theme')) applyTheme(event.matches ? 'dark' : 'light');
+});
 
 function showPeople() {
   requestId++;
@@ -69,6 +95,24 @@ function render(items) {
   $('next').disabled = (page + 1) * PAGE_SIZE >= total;
 }
 
+function applyGridView() {
+  const statusText = item => STATUS[item.participation_status]?.[0] || STATUS.review[0];
+  const values = {
+    title: item => `${item.title || ''} ${item.host || ''} ${item.platform || ''}`,
+    prize: item => item.prize || '',
+    deadline: item => formatDate(item.deadline),
+    status: item => item.participation_status || 'review',
+    updated: item => formatDate(item.participation?.updated_at, true),
+  };
+  let items = currentItems.filter(item => Object.entries(columnFilters).every(([key, filter]) => {
+    if (!filter) return true;
+    const value = key === 'status' ? values[key](item) : values[key](item).toLocaleLowerCase('ko-KR');
+    return value.includes(filter.toLocaleLowerCase('ko-KR')) || (key === 'status' && statusText(item).includes(filter));
+  }));
+  if (sortKey) items = [...items].sort((a, b) => values[sortKey](a).localeCompare(values[sortKey](b), 'ko-KR', { numeric: true }) * sortDirection);
+  render(items);
+}
+
 async function loadPage() {
   if (!sessionReady || $('board-view').hidden || !$('person').value) return;
   const id = ++requestId;
@@ -90,7 +134,8 @@ async function loadPage() {
       $(`stat-${key}`).textContent = Number(data.summary[key] || 0).toLocaleString('ko-KR');
     });
     $('list-title').textContent = `${people.find(p => p.key === $('person').value)?.label || '참가자'}의 내역`;
-    render(data.items);
+    currentItems = data.items;
+    applyGridView();
     message('board-message', '');
   } catch {
     if (id === requestId) message('board-message', '기록을 불러오지 못했음. 연결·접근 권한을 확인한 뒤 새로고침해 주세요.', true);
@@ -142,6 +187,21 @@ $('search-form').addEventListener('submit', event => { event.preventDefault(); s
 $('refresh').addEventListener('click', () => sessionReady ? loadPage() : loadPeople());
 $('prev').addEventListener('click', () => { if (page) { page--; loadPage(); } });
 $('next').addEventListener('click', () => { if ((page + 1) * PAGE_SIZE < total) { page++; loadPage(); } });
+document.querySelectorAll('[data-filter]').forEach(control => control.addEventListener('input', () => {
+  columnFilters[control.dataset.filter] = control.value.trim();
+  applyGridView();
+}));
+document.querySelectorAll('[data-sort]').forEach(button => button.addEventListener('click', () => {
+  const key = button.dataset.sort;
+  sortDirection = sortKey === key ? -sortDirection : 1;
+  sortKey = key;
+  document.querySelectorAll('[data-sort]').forEach(item => {
+    const active = item.dataset.sort === sortKey;
+    item.classList.toggle('active', active);
+    item.querySelector('span').textContent = active ? (sortDirection === 1 ? '↑' : '↓') : '↕';
+  });
+  applyGridView();
+}));
 
 const url = import.meta.env.VITE_SUPABASE_URL;
 const key = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
