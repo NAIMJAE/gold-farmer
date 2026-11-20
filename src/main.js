@@ -7,7 +7,7 @@ const PAGE_SIZE = 25;
 let client, page = 0, total = 0, requestId = 0, people = [];
 let search = '', sessionReady = false;
 let currentItems = [], sortKey = '', sortDirection = 1;
-const columnFilters = { title: '', prize: '', deadline: '', status: '', updated: '' };
+const columnFilters = { title: '', method: '', prize: '', deadline: '', status: '', updated: '' };
 
 const themeMedia = window.matchMedia('(prefers-color-scheme: dark)');
 
@@ -84,7 +84,7 @@ function render(items) {
       status.append(node('span', formLabels[item.participation.form_status] || '폼 확인 필요', 'status-detail'));
     }
     const date = item.participation?.updated_at;
-    tr.append(event, node('td', item.prize || '—', 'prize'), node('td', formatDate(item.deadline), 'date'), status,
+    tr.append(event, node('td', item.platform || '미확인'), node('td', item.prize || '—', 'prize'), node('td', formatDate(item.deadline), 'date'), status,
       node('td', formatDate(date, true), 'date'));
     return tr;
   }));
@@ -100,6 +100,7 @@ function applyGridView() {
   const values = {
     title: item => `${item.title || ''} ${item.host || ''} ${item.platform || ''}`,
     prize: item => item.prize || '',
+    method: item => item.platform || '미확인',
     deadline: item => formatDate(item.deadline),
     status: item => item.participation_status || 'review',
     updated: item => formatDate(item.participation?.updated_at, true),
@@ -110,7 +111,9 @@ function applyGridView() {
     return value.includes(filter.toLocaleLowerCase('ko-KR')) || (key === 'status' && statusText(item).includes(filter));
   }));
   if (sortKey) items = [...items].sort((a, b) => values[sortKey](a).localeCompare(values[sortKey](b), 'ko-KR', { numeric: true }) * sortDirection);
-  render(items);
+  total = items.length;
+  page = Math.min(page, Math.max(0, Math.ceil(total / PAGE_SIZE) - 1));
+  render(items.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE));
 }
 
 async function loadPage() {
@@ -122,19 +125,24 @@ async function loadPage() {
   $('empty').hidden = true;
   $('prev').disabled = $('next').disabled = true;
   try {
-    const { data, error } = await client.rpc('board_page', {
+    currentItems = [];
+    let data;
+    for (let offset = 0; ; offset += 100) {
+      const result = await client.rpc('board_page', {
       p_person: $('person').value, p_status: $('status').value, p_search: search,
-      p_offset: page * PAGE_SIZE, p_limit: PAGE_SIZE,
+      p_offset: offset, p_limit: 100,
     });
     if (id !== requestId) return;
-    if (error || !data) throw new Error('query');
-    total = Number(data.total);
-    if (page > 0 && page * PAGE_SIZE >= total) { page = Math.max(0, Math.ceil(total / PAGE_SIZE) - 1); return loadPage(); }
+      if (result.error || !result.data) throw new Error('query');
+      data = result.data;
+      currentItems.push(...data.items);
+      if (currentItems.length >= Number(data.total)) break;
+      if (!data.items.length) throw new Error('incomplete');
+    }
     ['total', 'completed', 'review', 'pending'].forEach(key => {
       $(`stat-${key}`).textContent = Number(data.summary[key] || 0).toLocaleString('ko-KR');
     });
     $('list-title').textContent = `${people.find(p => p.key === $('person').value)?.label || '참가자'}의 내역`;
-    currentItems = data.items;
     applyGridView();
     message('board-message', '');
   } catch {
@@ -185,16 +193,34 @@ $('person').addEventListener('change', () => selectPerson($('person').value));
 $('status').addEventListener('change', () => { page = 0; loadPage(); });
 $('search-form').addEventListener('submit', event => { event.preventDefault(); search = $('search').value.trim(); page = 0; loadPage(); });
 $('refresh').addEventListener('click', () => sessionReady ? loadPage() : loadPeople());
-$('prev').addEventListener('click', () => { if (page) { page--; loadPage(); } });
-$('next').addEventListener('click', () => { if ((page + 1) * PAGE_SIZE < total) { page++; loadPage(); } });
+$('prev').addEventListener('click', () => { if (page) { page--; applyGridView(); } });
+$('next').addEventListener('click', () => { if ((page + 1) * PAGE_SIZE < total) { page++; applyGridView(); } });
+const methodHeader = node('th');
+methodHeader.scope = 'col';
+const methodSort = node('button');
+methodSort.type = 'button';
+methodSort.dataset.sort = 'method';
+methodSort.append(document.createTextNode('참여방법 '), node('span', '↕'));
+methodHeader.append(methodSort);
+document.querySelector('.column-head').children[0].after(methodHeader);
+const methodFilterCell = node('th');
+const methodFilter = node('input');
+methodFilter.dataset.filter = 'method';
+methodFilter.placeholder = '참여방법 필터';
+methodFilter.setAttribute('aria-label', '참여방법 열 필터');
+methodFilterCell.append(methodFilter);
+document.querySelector('.column-filters').children[0].after(methodFilterCell);
+document.querySelector('.grid-note').textContent = '열 제목을 눌러 정렬 · 전체 목록에서 열별 필터';
 document.querySelectorAll('[data-filter]').forEach(control => control.addEventListener('input', () => {
   columnFilters[control.dataset.filter] = control.value.trim();
+  page = 0;
   applyGridView();
 }));
 document.querySelectorAll('[data-sort]').forEach(button => button.addEventListener('click', () => {
   const key = button.dataset.sort;
   sortDirection = sortKey === key ? -sortDirection : 1;
   sortKey = key;
+  page = 0;
   document.querySelectorAll('[data-sort]').forEach(item => {
     const active = item.dataset.sort === sortKey;
     item.classList.toggle('active', active);
