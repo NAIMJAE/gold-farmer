@@ -118,10 +118,18 @@ function applyGridView() {
     return value.includes(filter.toLocaleLowerCase('ko-KR')) || (key === 'status' && statusText(item).includes(filter));
   }));
   if (range.from || range.to) {
-    const day = range.basis === 'ann' ? item => kstDay(item.announce) : item => kstDay(item.participation?.updated_at);
+    const byAnn = range.basis === 'ann';
+    const day = byAnn ? item => kstDay(item.announce) : item => kstDay(item.participation?.updated_at);
+    const today = todayKst();
     items = items.filter(item => {
       const d = day(item);
-      return !!d && (!range.from || d >= range.from) && (!range.to || d <= range.to);
+      if (!d) {
+        // 참여일 기준: 참여일이 없는 미참여 항목은 마감이 안 지났을 때만(마감 없음 포함) 같이 보임 — 지난 것이 쌓이지 않게
+        if (byAnn) return false;
+        const end = kstDay(item.deadline);
+        return !end || end >= today;
+      }
+      return (!range.from || d >= range.from) && (!range.to || d <= range.to);
     });
   }
   if (sortKey) items = [...items].sort((a, b) => values[sortKey](a).localeCompare(values[sortKey](b), 'ko-KR', { numeric: true }) * sortDirection);
