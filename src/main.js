@@ -1,5 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
-import { STATUS, safeUrl, formatDate } from './format.js';
+import { STATUS, safeUrl, formatDate, kstDay, defaultRange } from './format.js';
 import './style.css';
 
 const $ = id => document.getElementById(id);
@@ -7,7 +7,9 @@ const PAGE_SIZE = 25;
 let client, page = 0, total = 0, requestId = 0, people = [];
 let search = '', sessionReady = false;
 let currentItems = [], sortKey = '', sortDirection = 1;
-const columnFilters = { title: '', method: '', prize: '', deadline: '', status: '', updated: '' };
+const columnFilters = { title: '', method: '', prize: '', deadline: '', announce: '', status: '', updated: '' };
+const range = { basis: 'done', from: '', to: '' };   // 조회 기준(참여일/발표일)과 기간(YYYY-MM-DD)
+let surveyCount = null, surveyRequest = 0;
 
 const themeMedia = window.matchMedia('(prefers-color-scheme: dark)');
 
@@ -35,7 +37,9 @@ themeMedia.addEventListener('change', event => {
 
 function showPeople() {
   requestId++;
+  surveyRequest++;
   $('board-view').hidden = true;
+  $('survey-view').hidden = true;
   $('people-view').hidden = false;
   $('events').replaceChildren();
   $('person').value = '';
@@ -49,6 +53,7 @@ function selectPerson(key) {
   search = '';
   $('search').value = '';
   $('status').value = '';
+  resetRange('done');
   ['total', 'completed', 'review', 'pending'].forEach(k => $(`stat-${k}`).textContent = '—');
   $('list-title').textContent = `${people.find(p => p.key === key).label}의 내역`;
   $('people-view').hidden = true;
@@ -84,7 +89,8 @@ function render(items) {
       status.append(node('span', formLabels[item.participation.form_status] || '폼 확인 필요', 'status-detail'));
     }
     const date = item.participation?.updated_at;
-    tr.append(event, node('td', item.platform || '미확인'), node('td', item.prize || '—', 'prize'), node('td', formatDate(item.deadline), 'date'), status,
+    tr.append(event, node('td', item.platform || '미확인'), node('td', item.prize || '—', 'prize'), node('td', formatDate(item.deadline), 'date'),
+      node('td', formatDate(item.announce), 'date'), status,
       node('td', formatDate(date, true), 'date'));
     return tr;
   }));
@@ -102,6 +108,7 @@ function applyGridView() {
     prize: item => item.prize || '',
     method: item => item.platform || '미확인',
     deadline: item => formatDate(item.deadline),
+    announce: item => formatDate(item.announce),
     status: item => item.participation_status || 'review',
     updated: item => formatDate(item.participation?.updated_at, true),
   };
@@ -110,6 +117,13 @@ function applyGridView() {
     const value = key === 'status' ? values[key](item) : values[key](item).toLocaleLowerCase('ko-KR');
     return value.includes(filter.toLocaleLowerCase('ko-KR')) || (key === 'status' && statusText(item).includes(filter));
   }));
+  if (range.from || range.to) {
+    const day = range.basis === 'ann' ? item => kstDay(item.announce) : item => kstDay(item.participation?.updated_at);
+    items = items.filter(item => {
+      const d = day(item);
+      return !!d && (!range.from || d >= range.from) && (!range.to || d <= range.to);
+    });
+  }
   if (sortKey) items = [...items].sort((a, b) => values[sortKey](a).localeCompare(values[sortKey](b), 'ko-KR', { numeric: true }) * sortDirection);
   total = items.length;
   page = Math.min(page, Math.max(0, Math.ceil(total / PAGE_SIZE) - 1));
@@ -152,6 +166,98 @@ async function loadPage() {
   }
 }
 
+function resetRange(basis) {
+  range.basis = basis;
+  [range.from, range.to] = defaultRange(basis, todayKst());
+  $('range-basis').value = basis;
+  $('range-from').value = range.from;
+  $('range-to').value = range.to;
+}
+
+function todayKst() { return kstDay(new Date().toISOString()); }
+
+function surveyQuery(select, options) {
+  return client.from('surveys').select(select, options).or(`end_date.is.null,end_date.gte.${todayKst()}`);
+}
+
+async function addSurveyCard() {
+  // 설문 표가 아직 없거나 못 읽으면 카드를 안 붙임
+  try {
+    const { count, error } = await surveyQuery('key', { count: 'exact', head: true });
+    if (error) return;
+    surveyCount = count || 0;
+  } catch { return; }
+  if (!$('people-cards').children.length || $('people-cards').querySelector('.survey-card')) return;
+  const card = node('button', null, 'person-card survey-card');
+  card.type = 'button';
+  card.append(node('span', '✎', 'person-avatar'), node('strong', '직접 참여 설문'),
+    node('span', `마감 전 ${surveyCount.toLocaleString('ko-KR')}건 · 링크 열어 직접 참여`, 'muted'));
+  card.addEventListener('click', showSurveys);
+  $('people-cards').append(card);
+}
+
+function showSurveys() {
+  requestId++;
+  $('people-view').hidden = true;
+  $('board-view').hidden = true;
+  $('survey-view').hidden = false;
+  loadSurveys();
+}
+
+async function loadSurveys() {
+  const id = ++surveyRequest;
+  message('survey-message', '설문을 불러오는 중…');
+  $('survey-refresh').disabled = true;
+  $('surveys').replaceChildren();
+  $('survey-empty').hidden = true;
+  try {
+    const { data, error } = await surveyQuery('key,title,host,prize,end_date,ann_date,platform,url,post,memo,need,q_direct,q_total,questions')
+      .order('end_date', { ascending: true, nullsFirst: false }).order('q_direct', { ascending: true });
+    if (id !== surveyRequest) return;
+    if (error) throw new Error('surveys');
+    renderSurveys(data || []);
+    message('survey-message', '');
+  } catch {
+    if (id === surveyRequest) message('survey-message', '설문을 불러오지 못했음. 연결을 확인한 뒤 새로고침해 주세요.', true);
+  } finally {
+    if (id === surveyRequest) $('survey-refresh').disabled = false;
+  }
+}
+
+function linkNode(text, href, className) {
+  const a = node('a', text, className);
+  a.href = href; a.target = '_blank'; a.rel = 'noopener noreferrer';
+  return a;
+}
+
+function renderSurveys(items) {
+  const today = todayKst();
+  $('surveys').replaceChildren(...items.map(item => {
+    const tr = node('tr');
+    const url = safeUrl(item.url);
+    const cell = node('td');
+    cell.append(url ? linkNode(item.title, url, 'event-title') : node('span', item.title, 'event-title'),
+      node('span', [item.host, item.platform].filter(Boolean).join(' · '), 'event-host'));
+    if (item.memo) cell.append(node('span', item.memo, 'survey-memo'));
+    if (item.need) cell.append(node('span', item.need, 'status-detail'));
+    const questions = node('td');
+    const count = node('span', item.q_direct == null ? '—' : `${item.q_direct}개`, 'badge pending');
+    if (item.questions?.length) count.title = item.questions.join('\n');
+    questions.append(count);
+    if (item.q_total != null) questions.append(node('span', `전체 ${item.q_total}문항`, 'status-detail'));
+    const deadline = node('td', formatDate(item.end_date), 'date');
+    if (item.end_date === today) deadline.append(node('span', '오늘 마감', 'badge review today-badge'));
+    const links = node('td', null, 'survey-links');
+    if (url) links.append(linkNode('참여하기', url, 'secondary'));
+    const post = safeUrl(item.post);
+    if (post) links.append(linkNode('게시물', post, 'post-link'));
+    tr.append(cell, node('td', item.prize || '—', 'prize'), questions, deadline, node('td', formatDate(item.ann_date), 'date'), links);
+    return tr;
+  }));
+  $('survey-empty').hidden = items.length > 0;
+  $('survey-count').textContent = `${items.length.toLocaleString('ko-KR')}개 설문`;
+}
+
 async function loadPeople() {
   sessionReady = false;
   $('people-refresh').disabled = true;
@@ -173,6 +279,7 @@ async function loadPeople() {
       card.addEventListener('click', () => selectPerson(p.key));
       return card;
     }));
+    addSurveyCard();
     sessionReady = true;
     page = 0;
     if (!people.length) {
@@ -187,6 +294,15 @@ async function loadPeople() {
 }
 
 $('back-people').addEventListener('click', () => { showPeople(); $('people-title').focus(); });
+$('back-survey').addEventListener('click', () => { showPeople(); $('people-title').focus(); });
+$('survey-refresh').addEventListener('click', loadSurveys);
+$('range-basis').addEventListener('change', () => { resetRange($('range-basis').value); page = 0; applyGridView(); });
+['range-from', 'range-to'].forEach(id => $(id).addEventListener('change', () => {
+  range.from = $('range-from').value;
+  range.to = $('range-to').value;
+  page = 0;
+  applyGridView();
+}));
 $('people-title').tabIndex = -1;
 $('people-refresh').addEventListener('click', loadPeople);
 $('person').addEventListener('change', () => selectPerson($('person').value));
