@@ -1,5 +1,5 @@
 export const STATUS = {
-  pending: ['미참여', 'pending'], running: ['진행 중', 'running'],
+  pending: ['미참여', 'pending'], queued: ['참여 대기', 'queued'], running: ['진행 중', 'running'],
   completed: ['참여 완료', 'completed'], review: ['확인 필요', 'review'],
   skipped: ['건너뜀', 'skipped'], failed: ['실패', 'failed'],
 };
