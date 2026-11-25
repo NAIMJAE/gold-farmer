@@ -54,7 +54,7 @@ function selectPerson(key) {
   $('search').value = '';
   $('status').value = '';
   resetRange('done');
-  ['total', 'completed', 'review', 'pending'].forEach(k => $(`stat-${k}`).textContent = '—');
+  ['total', 'completed', 'review', 'queued', 'pending'].forEach(k => $(`stat-${k}`).textContent = '—');
   $('list-title').textContent = `${people.find(p => p.key === key).label}의 내역`;
   $('people-view').hidden = true;
   $('board-view').hidden = false;
@@ -161,7 +161,7 @@ async function loadPage() {
       if (currentItems.length >= Number(data.total)) break;
       if (!data.items.length) throw new Error('incomplete');
     }
-    ['total', 'completed', 'review', 'pending'].forEach(key => {
+    ['total', 'completed', 'review', 'queued', 'pending'].forEach(key => {
       $(`stat-${key}`).textContent = Number(data.summary[key] || 0).toLocaleString('ko-KR');
     });
     $('list-title').textContent = `${people.find(p => p.key === $('person').value)?.label || '참가자'}의 내역`;

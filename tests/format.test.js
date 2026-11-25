@@ -29,6 +29,7 @@ test('기본 조회 기간: 참여일 -7~오늘, 발표일 -7~+7', () => {
   assert.deepEqual(defaultRange('ann', '2026-11-24'), ['2026-11-17', '2026-12-01']);
 });
 test('DB 참여 상태 모두 표시', () => {
-  assert.equal(Object.keys(STATUS).length, 6);
+  assert.equal(Object.keys(STATUS).length, 7);
+  assert.equal(STATUS.queued[0], '참여 대기');
   assert.equal(STATUS.review[0], '확인 필요');
 });
