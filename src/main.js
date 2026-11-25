@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import { STATUS, safeUrl, formatDate, kstDay, defaultRange } from './format.js';
+import { weekday, summarizeDays, groupWeeks } from './periods.js';
 import './style.css';
 
 const $ = id => document.getElementById(id);
@@ -8,7 +9,8 @@ let client, page = 0, total = 0, requestId = 0, people = [];
 let search = '', sessionReady = false;
 let currentItems = [], sortKey = '', sortDirection = 1;
 const columnFilters = { title: '', method: '', prize: '', deadline: '', announce: '', status: '', updated: '' };
-const range = { basis: 'done', from: '', to: '' };   // 조회 기준(참여일/발표일)과 기간(YYYY-MM-DD)
+const range = { basis: 'done', from: '', to: '', strict: false };   // 조회 기준(참여일/발표일)과 기간(YYYY-MM-DD). strict: 날짜 없는 미참여 항목을 빼고 그 기간 참여분만
+let periodItems = [], periodPerson = '', periodOpen = false;      // 회차별 참여 표: 상태·검색 필터와 무관한 전체 항목
 let surveyCount = null, surveyRequest = 0;
 
 const themeMedia = window.matchMedia('(prefers-color-scheme: dark)');
@@ -43,6 +45,7 @@ function showPeople() {
   $('people-view').hidden = false;
   $('events').replaceChildren();
   $('person').value = '';
+  clearPeriods();
 }
 
 function selectPerson(key) {
@@ -55,6 +58,7 @@ function selectPerson(key) {
   $('status').value = '';
   resetRange('done');
   ['total', 'completed', 'review', 'queued', 'pending'].forEach(k => $(`stat-${k}`).textContent = '—');
+  clearPeriods();
   $('list-title').textContent = `${people.find(p => p.key === key).label}의 내역`;
   $('people-view').hidden = true;
   $('board-view').hidden = false;
@@ -125,7 +129,7 @@ function applyGridView() {
       const d = day(item);
       if (!d) {
         // 참여일 기준: 참여일이 없는 미참여 항목은 마감이 안 지났을 때만(마감 없음 포함) 같이 보임 — 지난 것이 쌓이지 않게
-        if (byAnn) return false;
+        if (byAnn || range.strict) return false;
         const end = kstDay(item.deadline);
         return !end || end >= today;
       }
@@ -136,9 +140,26 @@ function applyGridView() {
   total = items.length;
   page = Math.min(page, Math.max(0, Math.ceil(total / PAGE_SIZE) - 1));
   render(items.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE));
+  syncPeriodSelection();
 }
 
-async function loadPage() {
+// 한 사람의 board_page 를 100건씩 끝까지 읽음. 중간에 요청이 바뀌면(isStale) null
+async function fetchAll(person, status, term, isStale) {
+  const items = [];
+  let data;
+  for (let offset = 0; ; offset += 100) {
+    const result = await client.rpc('board_page', { p_person: person, p_status: status, p_search: term, p_offset: offset, p_limit: 100 });
+    if (isStale()) return null;
+    if (result.error || !result.data) throw new Error('query');
+    data = result.data;
+    items.push(...data.items);
+    if (items.length >= Number(data.total)) break;
+    if (!data.items.length) throw new Error('incomplete');
+  }
+  return { items, data };
+}
+
+async function loadPage(force = false) {
   if (!sessionReady || $('board-view').hidden || !$('person').value) return;
   const id = ++requestId;
   message('board-message', '기록을 불러오는 중…');
@@ -147,26 +168,21 @@ async function loadPage() {
   $('empty').hidden = true;
   $('prev').disabled = $('next').disabled = true;
   try {
+    const person = $('person').value, status = $('status').value, term = search;
     currentItems = [];
-    let data;
-    for (let offset = 0; ; offset += 100) {
-      const result = await client.rpc('board_page', {
-      p_person: $('person').value, p_status: $('status').value, p_search: search,
-      p_offset: offset, p_limit: 100,
-    });
-    if (id !== requestId) return;
-      if (result.error || !result.data) throw new Error('query');
-      data = result.data;
-      currentItems.push(...data.items);
-      if (currentItems.length >= Number(data.total)) break;
-      if (!data.items.length) throw new Error('incomplete');
-    }
+    const got = await fetchAll(person, status, term, () => id !== requestId);
+    if (!got) return;
+    const { data } = got;
+    currentItems = got.items;
     ['total', 'completed', 'review', 'queued', 'pending'].forEach(key => {
       $(`stat-${key}`).textContent = Number(data.summary[key] || 0).toLocaleString('ko-KR');
     });
     $('list-title').textContent = `${people.find(p => p.key === $('person').value)?.label || '참가자'}의 내역`;
     applyGridView();
     message('board-message', '');
+    // 회차별 표는 상태·검색과 무관한 전체 기준: 필터 없이 읽은 때는 그대로 쓰고, 필터 중이면 따로 읽음(새로고침·사람 바뀜일 때만)
+    if (!status && !term) setPeriods(person, got.items);
+    else if (force || periodPerson !== person) loadPeriods(person, id);
   } catch {
     if (id === requestId) message('board-message', '기록을 불러오지 못했음. 연결·접근 권한을 확인한 뒤 새로고침해 주세요.', true);
   } finally {
@@ -174,8 +190,95 @@ async function loadPage() {
   }
 }
 
+// ---- 회차별 참여 표(참여일별·주별 건수) ----
+function clearPeriods() {
+  periodItems = []; periodPerson = ''; periodOpen = false;
+  $('period-card').hidden = true;
+  $('period-body').replaceChildren();
+}
+
+function setPeriods(person, items) {
+  periodItems = items; periodPerson = person;
+  renderPeriods();
+}
+
+async function loadPeriods(person, id) {
+  try {
+    const all = await fetchAll(person, '', '', () => id !== requestId);
+    if (all) setPeriods(person, all.items);
+  } catch { /* 목록은 이미 떴으므로 표만 못 띄움 */ }
+}
+
+function pickRow(from, to, className, cells) {
+  const tr = node('tr', null, `pick ${className}`);
+  tr.dataset.from = from; tr.dataset.to = to;
+  tr.tabIndex = 0;
+  tr.setAttribute('role', 'button');
+  tr.setAttribute('aria-pressed', 'false');
+  tr.append(...cells);
+  return tr;
+}
+
+function renderPeriods() {
+  const weeks = groupWeeks(summarizeDays(periodItems, item => kstDay(item.participation?.updated_at)), todayKst());
+  const dayCount = weeks.reduce((n, week) => n + week.days.length, 0);
+  const shown = periodOpen ? weeks : weeks.slice(0, 2);
+  const max = Math.max(1, ...weeks.flatMap(week => week.days.map(day => day.done)));
+  const count = (n, className) => node('td', n ? n.toLocaleString('ko-KR') : '·', className);
+  const today = todayKst();
+  const rows = shown.flatMap(week => {
+    const label = node('td', week.label);
+    label.append(node('span', `${week.start.slice(5)} ~ ${week.end.slice(5)}`, 'period-sub'));
+    return [
+      pickRow(week.start, week.end, 'week-row', [label, count(week.done), count(week.check), count(week.skipped), node('td', null, 'bar-cell')]),
+      ...week.days.map(day => {
+        const date = node('td', day.day.slice(5));
+        date.append(node('span', `${weekday(day.day)}${day.day === today ? ' · 오늘' : ''}`, 'period-sub'));
+        const bar = node('td', null, 'bar-cell');
+        const track = node('span', null, 'mini'), fill = node('span');
+        fill.style.width = `${Math.round(day.done / max * 100)}%`;
+        track.append(fill); bar.append(track);
+        return pickRow(day.day, day.day, 'day-row', [date, count(day.done, 'ok'), count(day.check, 'mute'), count(day.skipped, 'mute'), bar]);
+      }),
+    ];
+  });
+  $('period-body').replaceChildren(...rows);
+  $('period-body').closest('.table-wrap').hidden = !weeks.length;
+  $('period-empty').hidden = weeks.length > 0;
+  $('period-total').textContent = dayCount ? `${dayCount.toLocaleString('ko-KR')}회차` : '';
+  $('period-more').hidden = weeks.length <= 2;
+  $('period-more').textContent = periodOpen ? '접기' : `전체 ${dayCount.toLocaleString('ko-KR')}회차 보기`;
+  $('period-card').hidden = false;
+  syncPeriodSelection();
+}
+
+// 목록 기간이 표의 한 줄과 같으면 그 줄을 눌린 모양으로
+function syncPeriodSelection() {
+  document.querySelectorAll('#period-body .pick').forEach(row => {
+    const on = range.basis === 'done' && range.strict && range.from === row.dataset.from && range.to === row.dataset.to;
+    row.classList.toggle('sel', on);
+    row.setAttribute('aria-pressed', String(on));
+  });
+}
+
+function pickPeriod(from, to) {
+  const same = range.basis === 'done' && range.strict && range.from === from && range.to === to;
+  if (same) {
+    resetRange('done');
+  } else {
+    Object.assign(range, { basis: 'done', from, to, strict: true });
+    $('range-basis').value = 'done';
+    $('range-from').value = from;
+    $('range-to').value = to;
+  }
+  page = 0;
+  applyGridView();
+  if (!same) $('list-title').scrollIntoView({ block: 'start', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
+}
+
 function resetRange(basis) {
   range.basis = basis;
+  range.strict = false;
   [range.from, range.to] = defaultRange(basis, todayKst());
   $('range-basis').value = basis;
   $('range-from').value = range.from;
@@ -308,15 +411,25 @@ $('range-basis').addEventListener('change', () => { resetRange($('range-basis').
 ['range-from', 'range-to'].forEach(id => $(id).addEventListener('change', () => {
   range.from = $('range-from').value;
   range.to = $('range-to').value;
+  range.strict = false;
   page = 0;
   applyGridView();
 }));
+$('period-body').addEventListener('click', event => {
+  const row = event.target.closest('.pick');
+  if (row) pickPeriod(row.dataset.from, row.dataset.to);
+});
+$('period-body').addEventListener('keydown', event => {
+  const row = event.target.closest('.pick');
+  if (row && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); pickPeriod(row.dataset.from, row.dataset.to); }
+});
+$('period-more').addEventListener('click', () => { periodOpen = !periodOpen; renderPeriods(); });
 $('people-title').tabIndex = -1;
 $('people-refresh').addEventListener('click', loadPeople);
 $('person').addEventListener('change', () => selectPerson($('person').value));
 $('status').addEventListener('change', () => { page = 0; loadPage(); });
 $('search-form').addEventListener('submit', event => { event.preventDefault(); search = $('search').value.trim(); page = 0; loadPage(); });
-$('refresh').addEventListener('click', () => sessionReady ? loadPage() : loadPeople());
+$('refresh').addEventListener('click', () => sessionReady ? loadPage(true) : loadPeople());
 $('prev').addEventListener('click', () => { if (page) { page--; applyGridView(); } });
 $('next').addEventListener('click', () => { if ((page + 1) * PAGE_SIZE < total) { page++; applyGridView(); } });
 const methodHeader = node('th');
@@ -334,7 +447,7 @@ methodFilter.placeholder = '참여방법 필터';
 methodFilter.setAttribute('aria-label', '참여방법 열 필터');
 methodFilterCell.append(methodFilter);
 document.querySelector('.column-filters').children[0].after(methodFilterCell);
-document.querySelector('.grid-note').textContent = '열 제목을 눌러 정렬 · 전체 목록에서 열별 필터';
+$('list-title').parentElement.querySelector('.grid-note').textContent = '열 제목을 눌러 정렬 · 전체 목록에서 열별 필터';
 document.querySelectorAll('[data-filter]').forEach(control => control.addEventListener('input', () => {
   columnFilters[control.dataset.filter] = control.value.trim();
   page = 0;
